@@ -1,0 +1,3 @@
+/home/aman/Graphics/Assignment1/code/build/CMakeFiles/Assignment01.dir
+/home/aman/Graphics/Assignment1/code/build/CMakeFiles/edit_cache.dir
+/home/aman/Graphics/Assignment1/code/build/CMakeFiles/rebuild_cache.dir

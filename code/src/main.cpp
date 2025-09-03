@@ -19,30 +19,25 @@
 #include "utils.h"
 
 #define DRAW_PIECEWISE_BEZIER 1 // Use to switch between drawing control polyline and piecewise bezier curves
-#define SAMPLES_PER_BEZIER 100  // Sample each Bezier curve as N=10 segments and draw as connected lines
+#define SAMPLES_PER_BEZIER 10   // Sample each Bezier curve as N=10 segments and draw as connected lines
 
 // GLobal variables
 std::vector<float> controlPoints;
 std::vector<float> controlPolyline;
 std::vector<float> piecewiseBezier;
+std::vector<float> tangentLines;
 int width = 640, height = 640;
 bool controlPointsUpdated = false;
 bool controlPointsFinished = false;
 int selectedControlPoint = -1;
+bool showTangents = true;
 
-// --- Tangent editing state ---
-std::vector<float> userTangents;           // 3 floats per point: (tx, ty, 0) in NDC
-std::vector<unsigned char> hasUserTangent; // 0/1 per control point
-int selectedTangent = -1;                  // which control point's tangent is being dragged
-bool showTangents = true;                  // toggle to show/hide handles
+unsigned int VBO_tangentLines, VAO_tangentLines;
+struct point2d
+{
+    float x, y;
+};
 
-// Visualization geometry for tangents
-std::vector<float> tangentLines;  // line segments Pi -> Hi (Hi = Pi + Ti/3)
-std::vector<float> tangentPoints; // handle endpoints Hi as points
-
-// GL objects for tangent viz
-unsigned int VBO_tangentLines = 0, VAO_tangentLines = 0;
-unsigned int VBO_tangentPoints = 0, VAO_tangentPoints = 0;
 void calculateControlPolyline()
 {
     // Since controlPolyline is just a polyline, we can simply copy the control points and plot.
@@ -65,8 +60,7 @@ void calculateControlPolyline()
         controlPolyline.push_back(y[0]);
         controlPolyline.push_back(0.0);
 
-        // sampled thru linear interpolation?
-        t = 0.0;
+                t = 0.0;
         for (float j = 1; j < (SAMPLES_PER_BEZIER - 1); j++)
         {
             t += delta_t;
@@ -81,195 +75,103 @@ void calculateControlPolyline()
     controlPolyline.push_back(y[1]);
     controlPolyline.push_back(0.0);
 }
-static inline void ensureTangentArraysSized()
+
+void addPointAs3D(std::vector<float> &bezier, float x, float y)
 {
-    const size_t n = controlPoints.size() / 3;
-    if (userTangents.size() != controlPoints.size())
-        userTangents.assign(controlPoints.size(), 0.0f);
-    if (hasUserTangent.size() != n)
-        hasUserTangent.assign(n, 0);
+
+    bezier.push_back(x);
+    bezier.push_back(y);
+    bezier.push_back(0.0f);
 }
 
-static inline ImVec2 screenToNDC(float sx, float sy, int W, int H)
-{
-    // NDC: x,y in [-1,1], +y up
-    float x = 2.0f * (sx / float(W)) - 1.0f;
-    float y = 1.0f - 2.0f * (sy / float(H));
-    return ImVec2(x, y);
-}
-
-static inline float dist2(float ax, float ay, float bx, float by)
-{
-    float dx = ax - bx, dy = ay - by;
-    return dx * dx + dy * dy;
-}
-
-static void rebuildTangentViz()
+void calculateTangentVisuals(const std::vector<point2d> &B, const std::vector<point2d> &T)
 {
     tangentLines.clear();
-    tangentPoints.clear();
-
-    const int nPts = (int)controlPoints.size() / 3;
-    if (nPts == 0)
+    if (!showTangents)
         return;
 
-    ensureTangentArraysSized();
+    for (size_t i = 0; i < B.size(); ++i)
+    {
 
-    // Collect positions as 2D
-    std::vector<ImVec2> P(nPts);
-    for (int i = 0; i < nPts; ++i)
-    {
-        P[i].x = controlPoints[3 * i + 0];
-        P[i].y = controlPoints[3 * i + 1];
-    }
+        point2d handle_in = {B[i].x - T[i].x / 3.0f, B[i].y - T[i].y / 3.0f};
+        point2d handle_out = {B[i].x + T[i].x / 3.0f, B[i].y + T[i].y / 3.0f};
 
-    // Effective tangents T (auto, then override with user)
-    std::vector<ImVec2> T(nPts, ImVec2(0, 0));
-    if (nPts == 1)
-    {
-        T[0] = ImVec2(0, 0);
-    }
-    else if (nPts == 2)
-    {
-        ImVec2 t(P[1].x - P[0].x, P[1].y - P[0].y);
-        T[0] = t;
-        T[1] = t;
-    }
-    else
-    {
-        // One-sided at ends
-        T[0] = ImVec2(P[1].x - P[0].x, P[1].y - P[0].y);
-        T[nPts - 1] = ImVec2(P[nPts - 1].x - P[nPts - 2].x, P[nPts - 1].y - P[nPts - 2].y);
-        // Central difference (with 1/2 factor) inside
-        for (int i = 1; i < nPts - 1; ++i)
-        {
-            T[i] = ImVec2(0.5f * (P[i + 1].x - P[i - 1].x),
-                          0.5f * (P[i + 1].y - P[i - 1].y));
-        }
-    }
-    // Override with user-set tangents
-    for (int i = 0; i < nPts; ++i)
-    {
-        if (hasUserTangent[i])
-        {
-            T[i].x = userTangents[3 * i + 0];
-            T[i].y = userTangents[3 * i + 1];
-        }
-    }
-
-    // Build viz: line Pi->Hi and a point at Hi (Hi = Pi + T/3)
-    for (int i = 0; i < nPts; ++i)
-    {
-        ImVec2 Pi = P[i];
-        ImVec2 Hi = ImVec2(Pi.x + T[i].x / 3.0f, Pi.y + T[i].y / 3.0f);
-
-        tangentLines.push_back(Pi.x);
-        tangentLines.push_back(Pi.y);
-        tangentLines.push_back(0.0f);
-        tangentLines.push_back(Hi.x);
-        tangentLines.push_back(Hi.y);
-        tangentLines.push_back(0.0f);
-
-        tangentPoints.push_back(Hi.x);
-        tangentPoints.push_back(Hi.y);
-        tangentPoints.push_back(0.0f);
+        addPointAs3D(tangentLines, handle_in.x, handle_in.y);
+        addPointAs3D(tangentLines, handle_out.x, handle_out.y);
     }
 }
-
 void calculatePiecewiseBezier()
 {
     // TODO
+
+    // processing control points
     piecewiseBezier.clear();
 
-    const int nFloats = static_cast<int>(controlPoints.size());
-    if (nFloats < 2 * 3)
+    int m = (controlPoints.size());
+    if (m < 2 * 3) // checking if <=2 vertices
         return;
 
-    // -------- 1) Collect data points Pi (as 2D) --------
-    struct Pt
+    std::vector<point2d> B; // vector holding Bezier curve control points
+    B.reserve(m / 3);       // using reserve to allocate capacity
+    for (int i = 0; i + 2 < m; i += 3)
     {
-        float x, y;
-    };
-    std::vector<Pt> P;
-    P.reserve(nFloats / 3);
-    for (int i = 0; i + 2 < nFloats; i += 3)
-    {
-        P.push_back({controlPoints[i], controlPoints[i + 1]});
+        B.push_back({controlPoints[i], controlPoints[i + 1]});
     }
-    const int n = static_cast<int>(P.size()) - 1; // last index
-    if (n <= 0)
-        return; // only one point
+    int n = (B.size()) - 1; // last index
+    if (n <= 0)             // checking if only one point
+        return;
+    std::vector<point2d> T(B.size());
 
-    std::vector<Pt> T(P.size());
-    if (P.size() == 2)
+    // calculating tangents points
+    if (B.size() == 2) // if only 2 segments
     {
-        // Only one segment: simple one-sided tangents
-        T[0] = {P[1].x - P[0].x, P[1].y - P[0].y};
-        T[1] = {P[1].x - P[0].x, P[1].y - P[0].y};
+        T[0] = {B[1].x - B[0].x, B[1].y - B[0].y}; // finite difference
+        T[1] = {B[1].x - B[0].x, B[1].y - B[0].y};
     }
     else
     {
-        // Endpoints (one-sided)
-        T[0] = {P[1].x - P[0].x, P[1].y - P[0].y};
-        T[n] = {P[n].x - P[n - 1].x, P[n].y - P[n - 1].y};
-        // Interior (central difference with 1/2)
-        for (int i = 1; i < n; ++i)
+        T[0] = {B[1].x - B[0].x, B[1].y - B[0].y};
+        T[n] = {B[n].x - B[n - 1].x, B[n].y - B[n - 1].y};
+        for (int i = 1; i < n; i++)
         {
-            T[i] = {0.5f * (P[i + 1].x - P[i - 1].x),
-                    0.5f * (P[i + 1].y - P[i - 1].y)};
+            T[i] = {(B[i + 1].x - B[i - 1].x) * 0.5f, // using central difference
+                    (B[i + 1].y - B[i - 1].y) * 0.5f};
         }
     }
 
-    // --- NEW: override with user-set tangents (if any) ---
-    ensureTangentArraysSized();
-    for (int i = 0; i <= n; ++i)
-    {
-        if (i < (int)hasUserTangent.size() && hasUserTangent[i])
-        {
-            T[i].x = userTangents[3 * i + 0];
-            T[i].y = userTangents[3 * i + 1];
-        }
-    }
-
-    // Convenience lambda to push a 2D point as (x,y,0)
-    auto push3 = [&](float x, float y)
-    {
-        piecewiseBezier.push_back(x);
-        piecewiseBezier.push_back(y);
-        piecewiseBezier.push_back(0.0f);
-    };
-
-    // -------- 3) For each segment, build cubic Bezier and sample --------
-    const int samples = std::max(2, SAMPLES_PER_BEZIER);
-    const float inv = 1.0f / float(samples - 1);
+    // Calculate the visuals for the tangents
+    calculateTangentVisuals(B, T);
+    // For each segment, build cubic Bezier and sample
+    int samples = std::max(2, SAMPLES_PER_BEZIER);
+    float interval = 1.0f / (samples - 1);
     for (int i = 0; i < n; ++i)
     {
-        // Control points B0..B3 for the cubic between P[i] and P[i+1]
-        Pt B0 = P[i];
-        Pt B3 = P[i + 1];
-        Pt B1 = {P[i].x + T[i].x / 3.0f, P[i].y + T[i].y / 3.0f};
-        Pt B2 = {P[i + 1].x - T[i + 1].x / 3.0f, P[i + 1].y - T[i + 1].y / 3.0f};
-        // Sample [0,1] and append to piecewiseBezier
+        // Control points B0..B3 for the cubic between B[i] and B[i+1]
+        point2d B0 = B[i];
+        point2d B3 = B[i + 1];
+        point2d B1 = {B[i].x + T[i].x / 3.0f, B[i].y + T[i].y / 3.0f};
+        point2d B2 = {B[i + 1].x - T[i + 1].x / 3.0f, B[i + 1].y - T[i + 1].y / 3.0f};
+
+        // Sample [0,1] and append to piecewiseBezier (using parametric equation  t from 0 to 1)
         for (int k = 0; k < samples; ++k)
         {
-            float t = k * inv;
-            float u = 1.0f - t;
-            float b0 = u * u * u;        // (1-t)^3
-            float b1 = 3.0f * u * u * t; // 3(1-t)^2 t
-            float b2 = 3.0f * u * t * t; // 3(1-t) t^2
-            float b3 = t * t * t;        // t^3
+            float t = k * interval;
+            float v = 1.0f - t;
+            float b0 = v * v * v;
+            float b1 = 3.0f * v * v * t;
+            float b2 = 3.0f * v * t * t;
+            float b3 = t * t * t;
 
             float x = b0 * B0.x + b1 * B1.x + b2 * B2.x + b3 * B3.x;
             float y = b0 * B0.y + b1 * B1.y + b2 * B2.y + b3 * B3.y;
 
-            // Avoid duplicating the first sample of subsequent segments
             if (i > 0 && k == 0)
                 continue;
-            push3(x, y);
+
+            addPointAs3D(piecewiseBezier, x, y);
         }
     }
 }
-
 int main(int, char *argv[])
 {
     GLFWwindow *window = setupWindow(width, height);
@@ -290,12 +192,9 @@ int main(int, char *argv[])
     // TODO:
     glGenBuffers(1, &VBO_piecewiseBezier);
     glGenVertexArrays(1, &VAO_piecewiseBezier);
+
     glGenBuffers(1, &VBO_tangentLines);
     glGenVertexArrays(1, &VAO_tangentLines);
-
-    glGenBuffers(1, &VBO_tangentPoints);
-    glGenVertexArrays(1, &VAO_tangentPoints);
-
     int button_status = 0;
 
     // Display loop
@@ -308,6 +207,13 @@ int main(int, char *argv[])
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        ImGui::Begin("Options");
+        ImGui::Checkbox("Show Tangents", &showTangents);
+        if (ImGui::IsItemDeactivatedAfterEdit())
+        {
+            controlPointsUpdated = true; // Redraw when toggled
+        }
+        ImGui::End();
         // Rendering
         showOptionsDialog(controlPoints, io);
         ImGui::Render();
@@ -319,102 +225,51 @@ int main(int, char *argv[])
         glViewport(0, 0, display_w, display_h);
         glClearColor(clear_color.x, clear_color.y, clear_color.z, clear_color.w);
         glClear(GL_COLOR_BUFFER_BIT);
-        // --- Tangent editing (Shift + click/drag) ---
+
         if (!ImGui::IsAnyItemActive())
         {
-            int W = display_w, H = display_h;
-
-            // --- Phase A: BEFORE finishing, let user add points with L-click ---
-            if (!controlPointsFinished)
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
             {
-                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-                {
-                    float sx = io.MousePos.x, sy = io.MousePos.y;
-                    addControlPoint(controlPoints, sx, sy, width, height);
+                x = io.MousePos.x;
+                y = io.MousePos.y;
+                if (!controlPointsFinished)
+                { // Add points
+                    addControlPoint(controlPoints, x, y, width, height);
                     controlPointsUpdated = true;
                 }
-
-                if (ImGui::IsMouseClicked(ImGuiMouseButton_Right))
-                {
-                    controlPointsFinished = true; // switch to edit/tangent mode
+                else
+                { // Select point
+                    searchNearestControlPoint(x, y);
                 }
             }
-            else
-            {
-                // --- Phase B: AFTER finishing, allow point edit and tangent edit ---
 
-                // (1) Select a control point to edit (existing app behavior)
-                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && controlPointsFinished)
+            { // Edit points
+                if (selectedControlPoint >= 0)
                 {
-                    searchNearestControlPoint(io.MousePos.x, io.MousePos.y);
-                }
-
-                // (2) Drag to edit control point position
-                if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && selectedControlPoint >= 0)
-                {
-                    editControlPoint(controlPoints, io.MousePos.x, io.MousePos.y, width, height);
+                    x = io.MousePos.x;
+                    y = io.MousePos.y;
+                    editControlPoint(controlPoints, x, y, width, height);
                     controlPointsUpdated = true;
                 }
+            }
 
-                // (3) SHIFT + click/drag to edit tangents (io-based)
-                ensureTangentArraysSized();
-
-                bool shiftDown = io.KeyShift;
-                bool leftClicked = io.MouseClicked[ImGuiMouseButton_Left];
-                bool leftDown = io.MouseDown[ImGuiMouseButton_Left];
-                bool leftReleased = io.MouseReleased[ImGuiMouseButton_Left];
-                bool leftDragging = leftDown && (io.MouseDelta.x * io.MouseDelta.x + io.MouseDelta.y * io.MouseDelta.y > 0.0f);
-
-                // SHIFT + click: pick nearest control point for tangent editing
-                if (shiftDown && leftClicked)
-                {
-                    ImVec2 ndc = screenToNDC(io.MousePos.x, io.MousePos.y, W, H);
-                    const int nPts = (int)controlPoints.size() / 3;
-                    float bestD2 = 1e9f;
-                    int bestIdx = -1;
-                    for (int i = 0; i < nPts; ++i)
-                    {
-                        float px = controlPoints[3 * i + 0], py = controlPoints[3 * i + 1];
-                        float d2 = dist2(ndc.x, ndc.y, px, py);
-                        if (d2 < bestD2)
-                        {
-                            bestD2 = d2;
-                            bestIdx = i;
-                        }
-                    }
-                    selectedTangent = bestIdx;
-                }
-
-                // SHIFT + drag: set Ti = mouseNDC - Pi
-                if (shiftDown && leftDragging && selectedTangent >= 0)
-                {
-                    ImVec2 ndc = screenToNDC(io.MousePos.x, io.MousePos.y, W, H);
-                    int i = selectedTangent;
-                    float px = controlPoints[3 * i + 0], py = controlPoints[3 * i + 1];
-                    float tx = ndc.x - px, ty = ndc.y - py;
-
-                    userTangents[3 * i + 0] = tx;
-                    userTangents[3 * i + 1] = ty;
-                    userTangents[3 * i + 2] = 0.0f;
-                    hasUserTangent[i] = 1;
-                    controlPointsUpdated = true;
-                }
-
-                if (leftReleased)
-                    selectedTangent = -1;
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+            { // Stop adding points
+                controlPointsFinished = true;
             }
         }
 
         if (controlPointsUpdated)
         {
-            // Update VAO/VBO for control points (since we added a new point)
+            // Update VAO/VBO for control points
             glBindVertexArray(VAO_controlPoints);
             glBindBuffer(GL_ARRAY_BUFFER, VBO_controlPoints);
             glBufferData(GL_ARRAY_BUFFER, controlPoints.size() * sizeof(GLfloat), &controlPoints[0], GL_DYNAMIC_DRAW);
             glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void *)0);
             glEnableVertexAttribArray(0); // Enable first attribute buffer (vertices)
 
-            // Update VAO/VBO for the control polyline (since we added a new point)
+            // Update VAO/VBO for the control polyline
             calculateControlPolyline();
             glBindVertexArray(VAO_controlPolyline);
             glBindBuffer(GL_ARRAY_BUFFER, VBO_controlPolyline);
@@ -424,7 +279,7 @@ int main(int, char *argv[])
 
             // Update VAO/VBO for piecewise Bezier curve
             // TODO:
-            calculatePiecewiseBezier(); // <- your Bernstein/de Casteljau routine fills piecewiseBezier
+            calculatePiecewiseBezier();
             glBindVertexArray(VAO_piecewiseBezier);
             glBindBuffer(GL_ARRAY_BUFFER, VBO_piecewiseBezier);
             glBufferData(GL_ARRAY_BUFFER,
@@ -433,48 +288,20 @@ int main(int, char *argv[])
                          GL_DYNAMIC_DRAW);
             glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void *)0);
             glEnableVertexAttribArray(0);
-            controlPointsUpdated = false; // Finish all VAO/VBO updates before setting this to false.
-        }
-        // --- Tangent viz ---
-        if (showTangents)
-        {
-            rebuildTangentViz();
 
             glBindVertexArray(VAO_tangentLines);
             glBindBuffer(GL_ARRAY_BUFFER, VBO_tangentLines);
-            glBufferData(GL_ARRAY_BUFFER,
-                         tangentLines.size() * sizeof(GLfloat),
-                         tangentLines.empty() ? nullptr : tangentLines.data(),
-                         GL_DYNAMIC_DRAW);
+            glBufferData(GL_ARRAY_BUFFER, tangentLines.size() * sizeof(GLfloat), tangentLines.empty() ? nullptr : &tangentLines[0], GL_DYNAMIC_DRAW);
             glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void *)0);
             glEnableVertexAttribArray(0);
-
-            glBindVertexArray(VAO_tangentPoints);
-            glBindBuffer(GL_ARRAY_BUFFER, VBO_tangentPoints);
-            glBufferData(GL_ARRAY_BUFFER,
-                         tangentPoints.size() * sizeof(GLfloat),
-                         tangentPoints.empty() ? nullptr : tangentPoints.data(),
-                         GL_DYNAMIC_DRAW);
-            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void *)0);
-            glEnableVertexAttribArray(0);
+            controlPointsUpdated = false; // Finish all VAO/VBO updates before setting this to false.
         }
-        // Draw tangent handles (optional)
 
         glUseProgram(shaderProgram);
 
         // Draw control points
         glBindVertexArray(VAO_controlPoints);
         glDrawArrays(GL_POINTS, 0, controlPoints.size() / 3); // Draw points
-        if (showTangents)
-        {
-            // Lines Pi->Hi
-            glBindVertexArray(VAO_tangentLines);
-            glDrawArrays(GL_LINES, 0, tangentLines.size() / 3);
-
-            // Handle endpoints Hi
-            glBindVertexArray(VAO_tangentPoints);
-            glDrawArrays(GL_POINTS, 0, tangentPoints.size() / 3);
-        }
 
 #if DRAW_PIECEWISE_BEZIER
         // TODO:
@@ -485,7 +312,15 @@ int main(int, char *argv[])
         glBindVertexArray(VAO_controlPolyline);
         glDrawArrays(GL_LINE_STRIP, 0, controlPolyline.size() / 3); // Draw lines
 #endif
+        if (showTangents)
+        {
+            glBindVertexArray(VAO_tangentLines);
+            glDrawArrays(GL_LINES, 0, tangentLines.size() / 3);
+        }
 
+        // Draw control points on top
+        glBindVertexArray(VAO_controlPoints);
+        glDrawArrays(GL_POINTS, 0, controlPoints.size() / 3);
         glUseProgram(0);
 
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -495,22 +330,14 @@ int main(int, char *argv[])
     // Delete VBO buffers
     glDeleteBuffers(1, &VBO_controlPoints);
     glDeleteBuffers(1, &VBO_controlPolyline);
-    // TODO:
-    // Delete VBO buffers
-
     glDeleteBuffers(1, &VBO_piecewiseBezier);
-
+    glDeleteBuffers(1, &VBO_tangentLines);
     // Delete VAOs
     glDeleteVertexArrays(1, &VAO_controlPoints);
     glDeleteVertexArrays(1, &VAO_controlPolyline);
     glDeleteVertexArrays(1, &VAO_piecewiseBezier);
-
-    // Cleanup
-    glDeleteBuffers(1, &VBO_tangentLines);
     glDeleteVertexArrays(1, &VAO_tangentLines);
-    glDeleteBuffers(1, &VBO_tangentPoints);
-    glDeleteVertexArrays(1, &VAO_tangentPoints);
-
+    // Cleanup
     cleanup(window);
     return 0;
 }
